@@ -37,7 +37,7 @@ _TEST_PROBLEMS = add_transpose_flags((
 
 def randn(bs, x, y):
     out = (torch.rand(bs, x, y) - 0.5 * 2) / (y * x)
-    return out.cuda().to(torch.bfloat16)
+    return out.cuda().to(torch.half)
 
 
 def gmm(a, b, batch_sizes, trans_b=False):
