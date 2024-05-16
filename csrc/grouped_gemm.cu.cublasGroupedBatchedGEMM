@@ -1,0 +1,449 @@
+#include "grouped_gemm.h"
+
+#include <cstdio>
+#include <vector>
+#include <torch/torch.h>
+
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/util/Half.h>
+#include <c10/cuda/CUDAStream.h>
+#include <torch/extension.h>
+
+#include <cublas_v2.h>
+#include <cuda_runtime.h>
+
+namespace grouped_gemm {
+
+#define CUDA_CALL(func)                                     \
+    {                                                                     \
+        cudaError_t status = (func);                                      \
+        if (status != cudaSuccess) {                                      \
+            printf("CUDA error at %s:%d code=%d \"%s\" \n",               \
+                   __FILE__, __LINE__, status, cudaGetErrorString(status)); \
+            exit(EXIT_FAILURE);                                           \
+        }                                                                 \
+    }
+
+#define CUBLAS_CALL(func)                                                 \
+    {                                                                     \
+        cublasStatus_t status = (func);                                   \
+        if (status != CUBLAS_STATUS_SUCCESS) {                            \
+            printf("CUBLAS error at %s:%d code=%d \n",                    \
+                   __FILE__, __LINE__, status);                           \
+            exit(EXIT_FAILURE);                                           \
+        }                                                                 \
+    }
+
+#define GROUPED_GEMM_STRINGIFY_HELPER(x) #x
+#define GROUPED_GEMM_STRINGIFY(x) \
+  GROUPED_GEMM_STRINGIFY_HELPER(x)
+
+
+template <typename T>
+torch::Tensor CopyToDevice(const std::vector<T> &x, const torch::Device &device) {
+  size_t bytes = x.size() * sizeof(T);
+  auto options = torch::TensorOptions().dtype(torch::kInt8).device(device);
+  torch::Tensor out = torch::empty(bytes, options);
+
+  CUDA_CALL(cudaMemcpyAsync(out.data_ptr(),
+                            x.data(), bytes,
+                            cudaMemcpyHostToDevice,
+                            c10::cuda::getCurrentCUDAStream()));
+  return out;
+}
+
+
+void CublasGemm(double *a, int64_t a_rows/* m */, int64_t a_cols/* k */, bool trans_a/* false */,
+                double *b, int64_t b_rows/* k */, int64_t b_cols/* n */, bool trans_b/* false */,
+                double *c, int64_t c_rows/* m */, int64_t c_cols/* n */) {
+  int m/* n */ = trans_b/* false */ ? b_rows : b_cols/* n */;
+  int k/* k */ = trans_b/* false */ ? b_cols : b_rows/* k */;
+  int n/* m */ = trans_a/* false */ ? a_cols : a_rows/* m */;
+
+  int lda/* k */ = trans_a/* false */ ? n : k/* k */;
+  int ldb/* n */ = trans_b/* false */ ? k : m/* n */;
+  cublasOperation_t transpose_a = trans_a/* false */ ? CUBLAS_OP_T : CUBLAS_OP_N;
+  cublasOperation_t transpose_b = trans_b/* false */ ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+  float alpha = 1.0, beta = 0.0;
+  CUBLAS_CALL(cublasGemmEx(at::cuda::getCurrentCUDABlasHandle(),
+                           transpose_b, transpose_a,
+                           m/* n */, n/* m */, k, &alpha,
+                           b/* k * n */, CUDA_R_32F, ldb/* n */,
+                           a/* m * k */, CUDA_R_32F, lda/* k */,
+                           &beta,
+                           c, CUDA_R_32F, c_cols, CUDA_R_32F,
+                           CUBLAS_GEMM_DEFAULT));
+}
+
+void CublasGroupedBatchedGemm(torch::Tensor a,
+                              torch::Tensor b,
+                              torch::Tensor c,
+                              torch::Tensor batch_sizes,
+                              bool trans_b) {
+    bool trans_a = false;
+    int64_t bs = batch_sizes.size(0);
+    int64_t k = a.size(1);
+    int64_t n = trans_b ? b.size(1) : b.size(2);
+    int64_t b_rows = b.size(1), b_cols = b.size(2);
+
+    auto A = a.transpose(0, 1).clone().contiguous().cpu();
+
+    printf("---- Row-major A ----\n");
+//    for(int j = 0; j < a.size(0) * k; j++)
+//        printf("%f, ", *(a.data_ptr<double>() + j));
+//    printf("\n");
+    printf("------------------------\n");
+    printf("---- Column-major A ----\n");
+//    for(int j = 0; j < a.size(0) * k; j++)
+//        printf("%f, ", *(A.data_ptr<double>() + j));
+//    printf("\n");
+    printf("------------------------\n");
+//
+    auto B = b.transpose(1, 2).contiguous().clone().cpu();
+
+    printf("---- Column-major B ----\n");
+//    for(int j = 0; j < n * k * bs; j++)
+//        printf("%f, ", *(B.data_ptr<double>() + j));
+//    printf("\n");
+    printf("------------------------\n");
+
+    auto C = c.clone().contiguous().cpu();
+
+    printf("---- Column-major C(bef) ----\n");
+    for(int j = 0; j < a.size(0) * n; j++)
+        if(j%10000 == 0) { printf("%f, ", *(C.data_ptr<double>() + j)); }
+    printf("\n");
+    printf("-----------------------------\n");
+
+    const int gemm_count = bs;
+    std::vector<double*> d_A(gemm_count, nullptr);
+    std::vector<double*> d_B(gemm_count, nullptr);
+    std::vector<double*> d_C(gemm_count, nullptr);
+
+    double **d_A_array = nullptr;
+    double **d_B_array = nullptr;
+    double **d_C_array = nullptr;
+
+    cublasHandle_t cublasH;
+    cudaStream_t stream;
+
+    CUBLAS_CALL(cublasCreate(&cublasH));
+    CUDA_CALL(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    CUBLAS_CALL(cublasSetStream(cublasH, stream));
+
+    for (int i = 0; i < gemm_count; ++i) {
+        int64_t m = batch_sizes.data_ptr<int64_t>()[i];
+        CUDA_CALL(cudaMalloc(reinterpret_cast<void**>(&d_A[i]), sizeof(double) * m * k));
+        CUDA_CALL(cudaMalloc(reinterpret_cast<void**>(&d_B[i]), sizeof(double) * b_rows * b_cols));
+        CUDA_CALL(cudaMalloc(reinterpret_cast<void**>(&d_C[i]), sizeof(double) * m * n));
+    }
+
+    CUDA_CALL(cudaMalloc(reinterpret_cast<void**>(&d_A_array), sizeof(double*) * gemm_count));
+    CUDA_CALL(cudaMalloc(reinterpret_cast<void**>(&d_B_array), sizeof(double*) * gemm_count));
+    CUDA_CALL(cudaMalloc(reinterpret_cast<void**>(&d_C_array), sizeof(double*) * gemm_count));
+
+    for (int i = 0; i < gemm_count; ++i) {
+        int64_t m = batch_sizes.data_ptr<int64_t>()[i];
+
+        double* a_ptr = A.data_ptr<double>() + (i * m * k);
+        printf("A during copy: ");
+//        for(int j = 0; j < m * k; j++)
+//            printf("%f, ", *(a_ptr + j));
+        printf("\n");
+        CUDA_CALL(cudaMemcpyAsync(d_A[i], A.data_ptr<double>() + (i * m * k), sizeof(double) * (m * k), cudaMemcpyHostToDevice, stream));
+
+        double* b_ptr = B[i].data_ptr<double>();
+        printf("B during copy: ");
+//        for(int j = 0; j < b_rows * b_cols; j++)
+//            printf("%f, ", *(b_ptr + j));
+        printf("\n");
+        CUDA_CALL(cudaMemcpyAsync(d_B[i], B[i].data_ptr<double>(), sizeof(double) * (b_rows * b_cols), cudaMemcpyHostToDevice, stream));
+
+        CUDA_CALL(cudaMemcpyAsync(d_C[i], C.data_ptr<double>() + (i * m * n), sizeof(double) * (m * n), cudaMemcpyHostToDevice, stream));
+    }
+
+    CUDA_CALL(cudaMemcpyAsync(d_A_array, d_A.data(), sizeof(double*) * gemm_count, cudaMemcpyHostToDevice, stream));
+    CUDA_CALL(cudaMemcpyAsync(d_B_array, d_B.data(), sizeof(double*) * gemm_count, cudaMemcpyHostToDevice, stream));
+    CUDA_CALL(cudaMemcpyAsync(d_C_array, d_C.data(), sizeof(double*) * gemm_count, cudaMemcpyHostToDevice, stream));
+
+
+
+    cublasOperation_t* transa_array = new cublasOperation_t[bs];
+    cublasOperation_t* transb_array = new cublasOperation_t[bs];
+
+    int* m_array = new int[bs];
+    int* n_array = new int[bs];
+    int* k_array = new int[bs];
+
+    double* alpha_array = new double[bs];
+    double* beta_array = new double[bs];
+
+    int* lda_array = new int[bs];
+    int* ldb_array = new int[bs];
+    int* ldc_array = new int[bs];
+
+    int* group_size = new int[bs];
+
+    for (int i = 0; i < bs; ++i) {
+        int64_t m = batch_sizes.data_ptr<int64_t>()[i];
+
+        m_array[i] = m;
+        n_array[i] = n;
+        k_array[i] = k;
+
+        alpha_array[i] = 1.0;
+        beta_array[i] = 0.0;
+
+        lda_array[i] = k;
+        ldb_array[i] = b_cols;
+        ldc_array[i] = n;
+
+        group_size[i] = 1;
+
+        transa_array[i] = CUBLAS_OP_N;
+        transb_array[i] = trans_b ? CUBLAS_OP_T : CUBLAS_OP_N;
+    }
+
+    CUBLAS_CALL(cublasDgemmGroupedBatched(
+        at::cuda::getCurrentCUDABlasHandle(),
+//        transa_array, transb_array,
+//        m_array, n_array, k_array,
+//        alpha_array, d_A_array, lda_array,
+//        d_B_array, ldb_array, beta_array,
+
+        transb_array, transa_array,
+        n_array, m_array, k_array,
+        alpha_array, d_B_array, ldb_array,
+        d_A_array, lda_array, beta_array,
+
+        d_C_array, ldc_array,
+        bs, group_size
+    ));
+
+    // Step 4: copy data back to host
+    for (int i = 0; i < gemm_count; ++i) {
+        int64_t m = batch_sizes.data_ptr<int64_t>()[i];
+        CUDA_CALL(cudaMemcpyAsync(C.data_ptr<double>() + (i * m * n), d_C[i], sizeof(double) * (m * n), cudaMemcpyDeviceToHost, stream));
+    }
+
+    // Synchronize the stream to ensure all operations are completed
+    CUDA_CALL(cudaStreamSynchronize(stream));
+
+    printf("---- Column-major C(aft) ----\n");
+    for(int j = 0; j < a.size(0) * n; j++)
+        if(j%10000 == 0) { printf("%f, ", *(C.data_ptr<double>() + j)); }
+    printf("\n");
+    printf("------------------------\n");
+
+    auto C_t = C.transpose(0, 1).clone().contiguous().cpu();
+    for (int i = 0; i < a.size(0); i++){
+        for (int j = 0; j < n; j++) {
+            c[i][j] = C_t[i][j];
+        }
+    }
+    printf("Copy complete\n");
+
+    // Clean up
+    for (int i = 0; i < gemm_count; ++i) {
+        CUDA_CALL(cudaFree(d_A[i]));
+        CUDA_CALL(cudaFree(d_B[i]));
+        CUDA_CALL(cudaFree(d_C[i]));
+    }
+
+    CUDA_CALL(cudaFree(d_A_array));
+    CUDA_CALL(cudaFree(d_B_array));
+    CUDA_CALL(cudaFree(d_C_array));
+
+    CUBLAS_CALL(cublasDestroy(cublasH));
+    CUDA_CALL(cudaStreamDestroy(stream));
+
+    delete[] transa_array;
+    delete[] transb_array;
+    delete[] m_array;
+    delete[] n_array;
+    delete[] k_array;
+    delete[] alpha_array;
+    delete[] beta_array;
+    delete[] lda_array;
+    delete[] ldb_array;
+    delete[] ldc_array;
+    delete[] group_size;
+}
+
+void CublasGroupedBatchedGemmOneFinalAttempt(torch::Tensor a,
+                                             torch::Tensor b,
+                                             torch::Tensor c,
+                                             torch::Tensor batch_sizes,
+                                             bool trans_b) {
+//    z - batch size
+//    m, k, n
+//    A - (z * m) * k - 2D
+//    B - z * k * n   - 3D  | B.T - z * n * k
+//    C - (z * m) * n - 2D
+
+    int64_t bs = batch_sizes.size(0), k = a.size(1);
+    int64_t n = trans_b ? b.size(1) : b.size(2);
+    int64_t b_rows = b.size(1), b_cols = b.size(2);
+    double* a_ptr = a.data_ptr<double>();
+    double * b_ptr = b.data_ptr<double>();
+    double* c_ptr = c.data_ptr<double>();
+
+    cublasOperation_t* transa_array = new cublasOperation_t[bs];
+    cublasOperation_t* transb_array = new cublasOperation_t[bs];
+
+    int* m_array = new int[bs];
+    int* n_array = new int[bs];
+    int* k_array = new int[bs];
+
+    double* alpha_array = new double[bs];
+    double* beta_array = new double[bs];
+
+    int* lda_array = new int[bs];
+    int* ldb_array = new int[bs];
+    int* ldc_array = new int[bs];
+
+    int* group_size = new int[bs];
+
+    double** A_array = new double*[bs];
+    double** B_array = new double*[bs];
+    double** C_array = new double*[bs];
+
+
+    for (int i = 0; i < bs; ++i) {
+        int64_t m = batch_sizes.data_ptr<int64_t>()[i];
+
+        m_array[i] = m;
+        n_array[i] = n;
+        k_array[i] = k;
+
+        alpha_array[i] = 1.0;
+        beta_array[i] = 0.0;
+
+        lda_array[i] = k;
+        ldb_array[i] = b_cols;
+        ldc_array[i] = n;
+
+        group_size[i] = 1;
+
+        transa_array[i] = CUBLAS_OP_N;
+        transb_array[i] = trans_b ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+        A_array[i] = a_ptr;
+        B_array[i] = b_ptr;
+        C_array[i] = c_ptr;
+
+        a_ptr += m * k;
+        b_ptr += b_rows * b_cols;
+        c_ptr += m * n;
+    }
+
+    CUBLAS_CALL(cublasDgemmGroupedBatched(
+        at::cuda::getCurrentCUDABlasHandle(),
+//            transa_array, transb_array,
+//            m_array, n_array, k_array,
+//            alpha_array, d_A_array, lda_array,
+//            d_B_array, ldb_array, beta_array,
+
+        transb_array, transa_array,
+        n_array, m_array, k_array,
+        alpha_array, B_array, ldb_array,
+        A_array, lda_array, beta_array,
+
+        C_array, ldc_array,
+        bs, group_size
+    ));
+
+    for (int i = 0; i < bs; i++) {
+        int64_t m = batch_sizes.data_ptr<int64_t>()[i];
+        for (int j = 0; j < m; j++) {
+            for (int l = 0; l < n; l++) {
+                c[i * m * n + j * n + l] = C_array[i][j * n + l];
+            }
+        }
+    }
+
+    delete[] transa_array;
+    delete[] transb_array;
+    delete[] m_array;
+    delete[] n_array;
+    delete[] k_array;
+    delete[] alpha_array;
+    delete[] beta_array;
+    delete[] lda_array;
+    delete[] ldb_array;
+    delete[] ldc_array;
+    delete[] group_size;
+    delete[] A_array;
+    delete[] B_array;
+    delete[] C_array;
+}
+
+
+void CublasGroupedGemm(torch::Tensor a,
+                       torch::Tensor b,
+                       torch::Tensor c,
+                       torch::Tensor batch_sizes,
+                       bool trans_b) {
+//    z - batch size
+//    m, k, n
+//    A - (z * m) * k - 2D
+//    B - z * k * n   - 3D  | B.T - z * n * k
+//    C - (z * m) * n - 2D
+
+  int64_t bs = batch_sizes.size(0), k = a.size(1);
+  int64_t n = trans_b ? b.size(1) : b.size(2);
+  int64_t b_rows = b.size(1), b_cols = b.size(2);
+  double* a_ptr = a.data_ptr<double>();
+  double * b_ptr = b.data_ptr<double>();
+  double* c_ptr = c.data_ptr<double>();
+  for (int i = 0; i < bs; ++i) {
+    int64_t m = batch_sizes.data_ptr<int64_t>()[i];
+    CublasGemm(a_ptr, m, k, /*trans_a=*/false,
+               b_ptr, b_rows, b_cols, trans_b,
+               c_ptr, m, n);
+    a_ptr += m * k;
+    b_ptr += b_rows * b_cols;
+    c_ptr += m * n;
+  }
+}
+
+void CublasGroupedGemmVariableK(torch::Tensor a,
+                                torch::Tensor b,
+                                torch::Tensor c,
+                                torch::Tensor batch_sizes) {
+  int64_t bs = batch_sizes.size(0), m = a.size(1), n = b.size(1);
+  double* a_ptr = a.data_ptr<double>();
+  double* b_ptr = b.data_ptr<double>();
+  double* c_ptr = c.data_ptr<double>();
+  for (int i = 0; i < bs; ++i) {
+    int64_t k = batch_sizes.data_ptr<int64_t>()[i];
+    CublasGemm(a_ptr, k, m, /*trans_a=*/true,
+               b_ptr, k, n, /*trans_b=*/false,
+               c_ptr, m, n);
+    a_ptr += k * m;
+    b_ptr += k * n;
+    c_ptr += m * n;
+  }
+}
+
+
+// NOTE: We only support dynamic group sizes for the 'a' tensor. Tensor 'b' is
+// assumed to be batched with fixed sized batches.
+//
+// TODO(tgale): Validate alignment is true for every batch element.
+void GroupedGemm(torch::Tensor a,
+                 torch::Tensor b,
+                 torch::Tensor c,
+                 torch::Tensor batch_sizes,
+                 bool trans_a, bool trans_b) {
+    // Defer to the variable 'k' helper for the rest of the op.
+    if (trans_a) {
+        CublasGroupedGemmVariableK(a, b, c, batch_sizes);
+        return;
+    }
+
+
+        CublasGroupedBatchedGemmOneFinalAttempt(a, b, c, batch_sizes, trans_b);
+    return;
+}}
